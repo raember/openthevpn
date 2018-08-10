@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source bashme/bashme
+source bash-me/bashme
 
 # Basic settings
 loglevel=$LL_INFO
