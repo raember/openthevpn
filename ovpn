@@ -1,0 +1,650 @@
+#!/bin/bash
+
+source bashme/bashme
+
+# Basic settings
+loglevel=$LL_INFO
+
+# Setup:
+PROGRAM_NAME="${BOLD}OpenVPN helper${RESET}"
+VERSION="${FG_GREEN}v0.1${RESET}"
+YEAR=2018
+FULL_NAME="Raphael Emberger"
+LICENCE=
+EXPLANATION='Helper script for setting up OpenVPN connections.'
+USAGE=(
+  '-c|--ca [-f|--force]                    Setup the CA.'
+  '-s|--server {1-4|a} [-f|--force, -k n]  Setup the OpenVPN server.'
+  '--client [-f|--force]                   Setup a OpenVPN client.'
+  '--sign                                  Sign certificate requests.'
+  '-p|--pass-back {s,c}                    Pass the files back to the server/client.'
+  '-r|--revoke {s,c}                       Revoke a certificate of a server/client.'
+  '-a|--alert                              Alert the OpenVPN server about revoked client certificates.'
+  '--reset                                 Reset the locally cached files.'
+)
+define_opt '_help'    '-h' '--help'             ''       'Display this help text.'
+define_opt '_ver'     '-v' '--version'          ''       'Display the VERSION.'
+define_opt '_ca'      '-c' '--ca'               ''       'Setup the CA.'
+define_opt '_force'   '-f' '--force'            ''       'Forces redundant steps(like reinitializing the PKI).'
+define_opt '_server'  '-s' '--server'           'index'  "Setup the OpenVPN server(sub menu ${ITALIC}index${RESET}: 1-4 or a=all)."
+define_opt '_keysize' '-k' '--keysize'          'size'   "When generating DH parameters file, use a key of length ${ITALIC}size${RESET}(default: 2048). Only applicable with -s 3"
+define_opt '_client'  ''   '--client'           ''       'Setup the OpenVPN client.'
+define_opt '_sign'    ''   '--sign'             ''       'Sign certificates.'
+define_opt '_pass'    '-p' '--pass-back'        'system' "Pass the files back to the ${ITALIC}system${RESET}(s=server, c=client)."
+define_opt '_gen'     '-g' '--generate-profile' 'system' "Generate OpenVPN profile for the ${ITALIC}system${RESET}(s=server, c=client)."
+define_opt '_revoke'  '-r' '--revoke'           'system' "Revoke an issued certificate of the specified ${ITALIC}system${RESET}(s=server, c=client)"
+define_opt '_alert'   '-a' '--alert'            ''       'Alert OpenVPN server about revoked certificates.'
+define_opt '_reset'   ''   '--reset'            ''       'Reset the locally cached files.'
+DESCRIPTION="This script automates the actions the CA, the server and the client have to take to setup OpenVPN connections.
+General workflow:
+1. On the CA machine:
+  ./$(basename $0) -c
+2. On the OpenVPN server(depends on 1):
+  ./$(basename $0) -s {1-4,a}
+3. On the OpenVPN client(can be repeated for different clients):
+  ./$(basename $0) --client
+4. On the CA machine(depends on 1-3):
+  ./$(basename $0) --sign
+5. On the OpenVPN server(depends 4):
+  ./$(basename $0) -p s
+6. On the OpenVPN client(depends 4):
+  ./$(basename $0) -p c
+
+To revoke vertificates:
+1. On the CA machine:
+  ./$(basename $0) -r {s,c}
+2. On the OpenVPN server(depends on 1 with -r c):
+  ./$(basename $0) -a"
+
+# Parse arguments
+parse_args "$@"
+
+# Process options
+[[ -n "$_help" ]] && print_usage && exit
+[[ -n "$_ver" ]] && print_version && exit
+
+function main() {
+  local home="$(pwd)/.ovpn"
+  local ca="$home/ca/"
+  local ca_cert="$ca/pki/ca.crt"
+  local ca_crl="$ca/pki/crl.pem"
+  local server="$home/server"
+  local server_req="$server/pki/reqs"
+  local server_issued="$server/pki/issued"
+  local server_hmac_key="$server/openvpn/server/ta.key"
+  local clients="$home/clients"
+  local clients_req="$clients/pki/reqs"
+  local clients_issued="$clients/pki/issued"
+  mkdir -p "$home" || die "Couldn't create .ovpn folder"
+  if [[ -n "$_ca" ]]; then
+    setup_ca
+  elif [[ -n "$_server" ]]; then
+    case "$_server" in
+      a)
+        ca_public_certificate
+        server_certificate_and_private_key
+        diffie_hellman_dh_parameters_file
+        hash_based_message_authentication_code_hmac_key
+        ;;
+      1)
+        ca_public_certificate
+        ;;
+      2)
+        server_certificate_and_private_key
+        ;;
+      3)
+        diffie_hellman_dh_parameters_file
+        ;;
+      4)
+        hash_based_message_authentication_code_hmac_key
+        ;;
+      *)
+        die "Unknown index $_server. Known indices: 1-4(a: all)"
+        ;;
+    esac
+  elif [[ -n "$_client" ]]; then
+    client_cert_and_priv_key
+  elif [[ -n "$_sign" ]]; then
+    obtain_and_sign_the_certificates_on_the_ca
+  elif [[ -n "$_pass" ]]; then
+    pass_the_signed_certificates_back_to_the_server_and_clients
+  elif [[ -n "$_gen" ]]; then
+    generate_profile
+  elif [[ -n "$_revoke" ]]; then
+    revoke_a_certificate
+  elif [[ -n "$_alert" ]]; then
+    alert_the_openvpn_server
+  elif [[ -n "$_reset" ]]; then
+    reset
+  else
+    msg0 "$FG_GREEN" 'Nothing to do.'
+  fi
+}
+
+## Certificate Authority (CA)
+# -c
+function setup_ca() {
+  msg0 "$FG_CYAN" 'Setup CA:'
+  msg1 'Checking prerequisites...'
+    assume_system 'CA'
+    check_program easyrsa
+    check_root
+  msg1 'Setting up the CA...'
+    exec_cmd cd /etc/easy-rsa || die
+    exec_cmd 'export EASYRSA=$(pwd)' || die
+    init_pki
+    if [ ! -f /etc/easy-rsa/pki/private/ca.key ] || [ -n "$_force" ]; then
+      msg2 'No CA built yet. Build CA now'
+      exec_cmd easyrsa build-ca || die
+    else
+      msg2 'CA already built'
+    fi
+  msg1 'Stowing...'
+    msg2 "Stow the CA certificate to $ca_cert"
+    install -Dm600 /etc/easy-rsa/pki/ca.crt "$ca_cert" || die
+}
+
+## OpenVPN server files
+# -s 1
+function ca_public_certificate() {
+  msg0 "$FG_CYAN" 'CA public certificate:'
+  msg1 'Checking prerequisites...'
+    assume_system 'OpenVPN server'
+    check_root
+    check_file 'CA certificate' "$ca_cert"
+  msg1 'Setting up the OpenVPN server...'
+    msg2 'Copy CA certificate to /etc/openvpn/server/ca.crt'
+    exec_cmd install -Dm600 "'$ca_cert'" /etc/openvpn/server/ca.crt || die
+    exec_cmd chown root:root /etc/openvpn/server/ca.crt || die
+
+}
+# -s 2
+function server_certificate_and_private_key() {
+  msg0 "$FG_CYAN" 'Server certificate and private key:'
+  msg1 'Checking prerequisites...'
+    assume_system 'OpenVPN server'
+    check_program easyrsa
+    check_root
+  msg1 'Setting up server certificate and key...'
+    exec_cmd cd /etc/easy-rsa || die
+    init_pki
+    read -p '    File name: ' filename
+    [[ -z "$filename" ]] && filename='servername'
+    msg2 'Generate sign request'
+    exec_cmd easyrsa gen-req "'$filename'" nopass || die
+  msg1 'Stowing...'
+    msg2 'Copy the key to the openvpn server folder'
+    install -Dm600 "/etc/easy-rsa/pki/private/$filename.key" "/etc/openvpn/server/$filename.key" || die
+    msg2 'Copy the sign request'
+    install -Dm600 "/etc/easy-rsa/pki/reqs/$filename.req" "$server_req/$filename.req" || die
+}
+# -s 3
+function diffie_hellman_dh_parameters_file() {
+  msg0 "$FG_CYAN" 'Diffie-Hellman (DH) parameters file:'
+  msg1 'Checking prerequisites...'
+    assume_system 'OpenVPN server'
+    check_program openssl
+    check_root
+  msg1 'Creating the DH parameters file...'
+    if [[ -n "$_keysize" ]]; then
+      msg2 "Found key size argument. Using $_keysize as key size"
+    else
+      _keysize=2048
+    fi
+    msg2 'Create the initial dh.pem file'
+    exec_cmd openssl dhparam -out /etc/openvpn/server/dh.pem $_keysize || die
+}
+# -s 4
+function hash_based_message_authentication_code_hmac_key() {
+  msg0 "$FG_CYAN" 'Hash-based Message Authentication Code (HMAC) key:'
+  msg1 'Checking prerequisites...'
+    assume_system 'OpenVPN server'
+    check_program openvpn
+    check_root
+  msg1 'Creating the HMAC key...'
+    exec_cmd openvpn --genkey --secret /etc/openvpn/server/ta.key || die
+  msg1 'Stowing...'
+    msg2 'Copy the HMAC key'
+    install -Dm644 "/etc/openvpn/server/ta.key" "$server_hmac_key"
+}
+
+## OpenVPN client files
+# --client
+function client_cert_and_priv_key() {
+  msg0 "$FG_CYAN" 'Generating client certificate and private key:'
+  msg1 'Checking prerequisites...'
+    assume_system 'OpenVPN client'
+    check_program easyrsa
+    check_root
+  msg1 'Setting up client certificate and key...'
+    exec_cmd cd /etc/easy-rsa || die
+    init_pki
+    read -p '    File name: ' filename
+    [[ -z "$filename" ]] && filename='clientname'
+    msg2 'Generate sign request'
+    exec_cmd easyrsa gen-req "'$filename'" nopass || die
+  msg1 'Stowing...'
+    msg2 'Copy the key to the openvpn client folder'
+    install -Dm600 "/etc/easy-rsa/pki/private/$filename.key" "/etc/openvpn/client/$filename.key" || die
+    msg2 'Copy the sign request'
+    install -Dm600 "/etc/easy-rsa/pki/reqs/$filename.req" "$clients_req/$filename.req" || die
+}
+
+## Sign the certificates and pass them back to the server and clients
+# --sign
+function obtain_and_sign_the_certificates_on_the_ca() {
+  msg0 "$FG_CYAN" 'Obtain and sign the certificates on the CA:'
+  msg1 'Checking prerequisites...'
+    assume_system 'CA'
+    check_program easyrsa
+    check_program openssl
+    check_root
+    check_file 'Server certificate request' "$server_req/*.req"
+    check_file 'Client certificate requests' "$clients_req/*.req"
+  msg1 'Importing certificates...'
+    exec_cmd cd /etc/easy-rsa || die
+    local _server
+    local _server_name
+    local -a _clients=()
+    local -a _client_names=()
+    msg2 'Import server certificate'
+    local _dir="$server_req"
+    local req=$(
+      ls $_dir/*.req | \
+      grep -Eo '[^/]+\.req$' | \
+      head -n1
+    )
+    req="${req/.req/}"
+    get_certificate_info "$_dir/$req.req"
+    local cn="${CERT_SUBJ[CN]}"
+    if [ -f "/etc/easy-rsa/pki/reqs/$req.req" ]; then
+      msg2 "'$cn'($req.req) already imported. Skipped"
+    else
+      msg2 "Importing '$cn'($req.req)"
+      exec_cmd easyrsa import-req "'$_dir/$req.req'" "'$req'" || die
+    fi
+    _server="$req"
+    _server_name="$cn"
+    echo "$_server -> $_server_name"
+    msg2 'Import client certificates'
+    _dir="$clients_req"
+    for req in $(ls $_dir/*.req | grep -Eo '[^/]+\.req$'); do
+      req="${req/.req/}"
+      get_certificate_info "$_dir/$req.req"
+      local cn="${CERT_SUBJ[CN]}"
+      if [ -f "/etc/easy-rsa/pki/reqs/$req.req" ]; then
+        msg2 "'$cn'($req.req) already imported. Skipped"
+      else
+        msg2 "Importing '$cn'($req.req)"
+        exec_cmd easyrsa import-req "'$_dir/$req.req'" "'$req'" || die
+      fi
+      _clients+=("$req")
+      _client_names+=("$cn")
+    done
+  msg1 'Signing certificates...'
+    local server_cert
+    local -a client_certs=()
+    msg2 'Sign server certificate'
+    sign_certificate server "$_server" "$_server_name"
+    server_cert="$_server"
+    msg2 'Sign client certificates'
+    local -i index
+    for ((index=0;index<${#_clients[@]};index++)); do
+      local _client="${_clients[$index]}"
+      local _client_name="${_client_names[$index]}"
+      sign_certificate client "$_client" "$_client_name"
+      client_certs+=("$_client")
+    done
+  msg1 'Stowing signed certificates...'
+    msg2 "Copy $_server_name($server_cert.crt)"
+    install -Dm600 "/etc/easy-rsa/pki/issued/$server_cert.crt" "$server_issued/$server_cert.crt" || die
+    for ((index=0;index<${#client_certs[@]};index++)); do
+      local _client="${client_certs[$index]}"
+      local _client_name="${_client_names[$index]}"
+      msg2 "Copy $_client_name($_client.crt)"
+      install -Dm600 "/etc/easy-rsa/pki/issued/$_client.crt" "$clients_issued/$_client.crt" || die
+    done
+}
+
+## Pass the signed certificates back to the server and client(s)
+# -p system
+function pass_the_signed_certificates_back_to_the_server_and_clients() {
+  case "$_pass" in
+    s) # Server (✓ca.crt, server.crt, ✓server.key, ✓dh.pem, ✓ta.key)
+      msg0 "$FG_CYAN" 'Pass the signed certificate back to the server:'
+      msg1 'Checking prerequisites...'
+        assume_system 'OpenVPN server'
+        check_root
+        check_file 'CA certificate' "$ca_cert"
+        check_file 'Server certificate' "$server_issued/*.crt"
+        check_file 'Server certificate' "/etc/easy-rsa/pki/private/*.key"
+      msg1 'Passing back the signed certificate...'
+        local name=$(
+          ls $server_issued/*.crt | \
+          grep -Eo '[^/]+\.crt$' | \
+          sed 's/\.crt//' | \
+          head -n1
+        )
+        install -Dm600 "$server_issued/$name.crt" "/etc/openvpn/server/$name.crt" || die
+        msg2 'Set ownership to root'
+        chown root:root "/etc/openvpn/server/$name.crt"
+      ;;
+    c) # Client (ca.crt, client.crt, ✓client.key, ta.key)
+      msg0 "$FG_CYAN" 'Pass the signed certificates back to the client:'
+      msg1 'Checking prerequisites...'
+        assume_system 'OpenVPN server'
+        check_root
+        check_file 'CA certificate' "$ca_cert"
+        local -a _certs=($(
+          ls $clients_issued/*.crt | \
+          grep -Eo '[^/]+\.crt$' | \
+          sed 's/\.crt//'
+        ))
+        local name=${_certs[0]}
+        [[ "${#_certs[@]}" -eq 0 ]] && die "Couldn't find any client certificates."
+        if [[ "${#_certs[@]}" -gt 1 ]]; then
+          msg2 "Multiple client certificates found. Please choose(tab completion enabled)"
+          TAB_COMPLETIONS=("${_certs[@]}")
+          enable_tab_completion
+          read -ep '    Certificate: ' name
+          disable_tab_completion
+          clean_tab_suggestions
+        fi
+        check_file 'Client certificate' "$clients_issued/$name.crt"
+        check_file 'Client certificate' "/etc/easy-rsa/pki/private/$name.key"
+        check_file 'HMAC key' "$server_hmac_key"
+      msg1 'Copying the CA certificate...'
+        install -Dm600 "$ca_cert" "/etc/openvpn/client/ca.crt" || die
+      msg1 'Passing back the signed certificate...'
+        install -Dm600 "$clients_issued/$name.crt" "/etc/easy-rsa/pki/signed/$name.crt" || die
+        install -Dm600 "$clients_issued/$name.crt" "/etc/openvpn/client/$name.crt" || die
+      msg1 'Copying the DH parameters file...'
+        install -Dm600 "$server_hmac_key" "/etc/openvpn/client/ta.key" || die
+      ;;
+    *) # Bruh...
+      die "You tried..."
+      ;;
+  esac
+}
+
+## Generate OpenVPN profile
+# -g {s,c}
+function generate_profile() {
+  case "$_gen" in
+    s) # Server
+      msg0 "$FG_CYAN" 'Generate OpenVPN profile for the server:'
+      msg1 'Checking prerequisites...'
+        assume_system 'OpenVPN server'
+        check_root
+      msg1 'Generating the profile...'
+        msg2 'Get the necessary information'
+        local name=$(
+          ls $server_issued/*.crt | \
+          grep -Eo '[^/]+\.crt$' | \
+          sed 's/\.crt//' | \
+          head -n1
+        )
+        msg2 'Write the profile'
+        cat /usr/share/openvpn/examples/server.conf | \
+          sed -e "s/^\(cert\) .*$/\1 $name.crt/" \
+              -e "s/^\(key\) .*$/\1 $name.key  # This file should be kept secret/" \
+              -e 's/^\(dh\) .*$/\1 dh.pem/' \
+              -e 's/^\(tls-auth\) .*$/tls-crypt ta.key # Replaces tls-auth ta.key 0/' \
+              -e 's/^;\(user nobody\)$/\1/' \
+              -e 's/^;\(group nobody\)$/\1/' \
+              # -e '/^\(#\|;\).*$/d' -e '/^$/d' \
+          > /etc/openvpn/server/server.conf
+      ;;
+    c) # Client
+      msg0 "$FG_CYAN" 'Generate OpenVPN profile for the client:'
+      msg1 'Checking prerequisites...'
+        assume_system 'OpenVPN server'
+        check_root
+      msg1 'Generating the profile...'
+        msg2 'Get the necessary information'
+        local remote
+        read -rp '    Remote server address: ' remote
+        local -i port=1194
+        read -ri 1194 -p '    Remote server port[1194]: ' port
+        ((port==0)) && port=1194
+        local -a _certs=($(
+          ls $clients_issued/*.crt | \
+          grep -Eo '[^/]+\.crt$' | \
+          sed 's/\.crt//'
+        ))
+        local name=${_certs[0]}
+        [[ "${#_certs[@]}" -eq 0 ]] && die "Couldn't find any client certificates."
+        if [[ "${#_certs[@]}" -gt 1 ]]; then
+          msg2 "Multiple client certificates found. Please choose(tab completion enabled)"
+          TAB_COMPLETIONS=("${_certs[@]}")
+          enable_tab_completion
+          read -ep '    Certificate: ' name
+          disable_tab_completion
+          clean_tab_suggestions
+        fi
+        msg2 'Write the profile'
+        cat /usr/share/openvpn/examples/client.conf | \
+          sed -e "s/^\(remote\) my-server-1 1194$/\1 $remote $port/" \
+              -e 's/^;\(user nobody\)$/\1/' \
+              -e 's/^;\(group nobody\)$/\1/' \
+              -e "s/^\(cert\) .*$/\1 $name.crt/" \
+              -e "s/^\(key\) .*$/\1 $name.key/" \
+              -e 's/^\(tls-auth\) .*$/tls-crypt ta.key # Replaces tls-auth ta.key 0/' \
+              -e '/^\(#\|;\).*$/d' -e '/^$/d' \
+          > /etc/openvpn/client/client.conf
+      ;;
+    *) # Bruh...
+      die "You tried..."
+      ;;
+  esac
+}
+
+## Revoke
+# --revoke
+function revoke_a_certificate() {
+  case "$_revoke" in
+    s) # Server
+      msg0 "$FG_CYAN" 'Revoke a certificate:'
+      msg1 'Checking prerequisites...'
+        assume_system 'CA'
+        check_root
+        check_program easyrsa
+        check_file 'Server certificate' "$server_issued/*.crt"
+      msg1 'Revoking the server certificate...'
+        local name=$(
+          ls $server_issued/*.crt | \
+          grep -Eo '[^/]+\.crt$' | \
+          sed 's/\.crt//' | \
+          head -n1
+        )
+        msg2 "Found server certificate $name.crt"
+        exec_cmd cd /etc/easy-rsa || die
+        exec_cmd easyrsa revoke "'$name'" || die
+        exec_cmd easyrsa gen-crl || die
+      msg1 'Stowing...'
+        msg2 "Copy /etc/easy-rsa/pki/crl.pem"
+        install -Dm600 "/etc/easy-rsa/pki/crl.pem" "$ca_crl" || die
+        _alert=1
+      ;;
+    c) # Client (ca.crt, client.crt, ✓client.key, ta.key)
+      msg0 "$FG_CYAN" 'Pass the signed certificates back to the client:'
+      msg1 'Checking prerequisites...'
+        assume_system 'CA'
+        check_root
+        check_program easyrsa
+        check_file 'Client certificates' "$clients_issued/*.crt"
+        local -a _certs=($(
+          ls $clients_issued/*.crt | \
+          grep -Eo '[^/]+\.crt$' | \
+          sed 's/\.crt//'
+        ))
+        local name=${_certs[0]}
+        [[ "${#_certs[@]}" -eq 0 ]] && die "Couldn't find any client certificates."
+        if [[ "${#_certs[@]}" -gt 1 ]]; then
+          msg2 "Multiple client certificates found. Please choose(tab completion enabled)"
+          TAB_COMPLETIONS=("${_certs[@]}")
+          enable_tab_completion
+          read -ep '    Certificate: ' name
+          disable_tab_completion
+          clean_tab_suggestions
+        fi
+        check_file 'Client certificate' "$clients_issued/$name.crt"
+        get_certificate_info "$clients_issued/$name.crt"
+        local cn="${CERT_SUBJ[CN]}"
+        msg2 "Found server certificate $cn($name.crt)"
+        exec_cmd cd /etc/easy-rsa || die
+        exec_cmd easyrsa revoke "'$name'" || die
+        exec_cmd easyrsa gen-crl || die
+      msg1 'Stowing...'
+        msg2 "Copy /etc/easy-rsa/pki/crl.pem"
+        install -Dm600 "/etc/easy-rsa/pki/crl.pem" "$ca_crl" || die
+      ;;
+    *) # Bruh...
+      die "You tried..."
+      ;;
+  esac
+}
+
+## Alert the OpenVPN server
+# -a
+function alert_the_openvpn_server() {
+  msg0 "$FG_CYAN" 'Alert the OpenVPN server:'
+  msg1 'Checking prerequisites...'
+    assume_system 'OpenVPN server'
+    check_root
+    check_file 'CA revocation pem' "$ca_crl"
+  msg1 'Alerting...'
+    msg2 'Copy over the crl.pem'
+    exec_cmd install -Dm600 "$ca_crl" '/etc/openvpn/server/crl.pem' || die
+    exec_cmd chown root:root '/etc/openvpn/server/crl.pem' || die
+    if grep 'crl-verify' /etc/openvpn/server/server.conf &> /dev/null; then
+      msg2 'Uncomment the crl-verify directive'
+      exec_cmd sed -iz "'s/^;crl-verify .*$/crl-verify \/etc\/openvpn\/server\/crl\.pem/'" /etc/openvpn/server/server.conf || die
+    else
+      msg2 'Adding crl-verify directive to server.conf'
+      exec_cmd "echo -e \"\ncrl-verify /etc/openvpn/server/crl.pem\" >> /etc/openvpn/server/server.conf" || die
+    fi
+    msg2 'Restart the server'
+    exec_cmd systemctl restart openvpn-server@server.service
+}
+
+## Reset
+# -r
+function reset() {
+  msg0 "$FG_CYAN" 'Reset:'
+  msg1 'Resetting the local database...'
+    msg2 'Delete files'
+    if [ -d "$home" ]; then
+      rm -r "$home"
+    fi
+}
+
+
+
+# Helper methods
+declare -A CERT_SUBJ=()
+function get_certificate_info() { # file
+  CERT_SUBJ=()
+  local file="$1"
+  local method
+  case "$file" in
+    *.pem|*.crt)
+      method=x509
+      ;;
+    *.req)
+      method=req
+      ;;
+    *)
+      die "Couldn't find an appropriate method for file: $file"
+  esac
+  while read -rd ', ' key equal value; do
+    CERT_SUBJ+=([$key]="$value")
+  done <<< $(
+    openssl $method -in "$file" -noout -text | \
+    grep -o 'Subject: .*' | \
+    cut -c 10- | \
+    sed 's/$/, /'
+  )
+}
+function sign_certificate() { # type, filename, name
+  local type="$1"
+  local file="$2"
+  local name="$3"
+  if [ -f "/etc/easy-rsa/pki/issued/$file.crt" ] && [ -z "$_force" ]; then
+    msg2 "'$name' already signed. Skipped"
+  else
+    msg2 "Signing '$name'"
+    exec_cmd easyrsa sign-req $type "'$file'" || die
+  fi
+}
+function check_program() {
+  local program="$1"
+  if type $program &> /dev/null; then
+    msg2 "Found $program"
+  else
+    die "$program not installed."
+  fi
+}
+function check_root() {
+  if [ "$EUID" -eq 0 ]; then
+    msg2 'Script runs with root privileges'
+  else
+    die 'Script must be run as root.'
+  fi
+}
+function check_file() {
+  local name="$1"
+  local path="$2"
+  if ls $path &> /dev/null; then
+    msg2 "Could locate '$name' at ${path/$home\//}"
+  else
+    die "Couldn't locate '$name' at ${path/$home\//}"
+  fi
+}
+function init_pki() {
+  if [ ! -d pki ] || [ -n "$_force" ]; then
+    msg2 'No PKI initialized. Initializing now'
+    exec_cmd easyrsa init-pki || die
+  else
+    msg2 'PKI already initialized'
+  fi
+}
+function assume_system() {
+  msg2 "Assuming $1"
+  [[ -z "$_force" ]] && read -p '     Confirm(Enter) '
+}
+function exec_cmd() {
+  debug "$*"
+  echo " ${BOLD}${FG_RED}\$ ${RESET}${ITALIC}$*${RESET}"
+  eval "$*"
+  local retval=${PIPESTATUS[0]}
+  check_retval $retval
+  return $retval
+}
+
+function msg0() {
+  local format="$1"
+  shift
+  info "${BOLD}${format}::${RESET} $*${RESET}"
+}
+function msg1() {
+  info "${BOLD}${FG_GREEN}==>${RESET} ${BOLD}$*${RESET}"
+}
+function msg2() {
+  info "  ${BOLD}${FG_BLUE}->${RESET} ${BOLD}$*${RESET}"
+}
+function die() {
+  (($#==0)) && set -- "An error occurred."
+  fatal "${BOLD}${FG_RED}==> ERROR:${RESET} ${BOLD}$*${RESET}"
+  exit
+}
+sig_err() {
+  die 'An error occurred! Exiting...'
+  exit;
+}
+sig_int() {
+  die 'Aborted by user! Exiting...'
+}
+trap_signals
+
+main
